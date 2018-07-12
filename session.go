@@ -44,8 +44,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"context"
 
-	"github.com/globalsign/mgo/bson"
+	"github.com/easyops.cn/mgo/bson"
+	"github.com/openzipkin/zipkin-go"
 )
 
 // Mode read preference mode. See Eventual, Monotonic and Strong for details
@@ -112,6 +114,8 @@ type Session struct {
 	slaveOk          bool
 
 	dialInfo *DialInfo
+
+	tracer      *zipkin.Tracer
 }
 
 // Database holds collections of documents
@@ -135,6 +139,7 @@ type Collection struct {
 	Database *Database
 	Name     string // "collection"
 	FullName string // "db.collection"
+	Ctx      context.Context
 }
 
 // Query keeps info on the query.
@@ -142,6 +147,7 @@ type Query struct {
 	m       sync.Mutex
 	session *Session
 	query   // Enables default settings in session.
+	ctx     context.Context
 }
 
 type query struct {
@@ -906,8 +912,11 @@ func (s *Session) DB(name string) *Database {
 //
 // Creating this value is a very lightweight operation, and
 // involves no network communication.
-func (db *Database) C(name string) *Collection {
-	return &Collection{db, name, db.Name + "." + name}
+func (db *Database) C(name string, ctx ...context.Context) *Collection {
+	if len(ctx) >= 1 {
+		return &Collection{db, name, db.Name + "." + name, ctx[0]}
+	}
+	return &Collection{db, name, db.Name + "." + name, nil}
 }
 
 // CreateView creates a view as the result of the applying the specified
@@ -2599,6 +2608,7 @@ func (c *Collection) Find(query interface{}) *Query {
 	session.m.RUnlock()
 	q.op.query = query
 	q.op.collection = c.FullName
+	q.ctx = c.Ctx
 	return q
 }
 
@@ -3683,6 +3693,10 @@ Error:
 // desired.
 //
 func (q *Query) One(result interface{}) (err error) {
+	span, _ := q.session.tracer.StartSpanFromContext(q.ctx, "findOne")
+	defer span.Finish()
+	span.Tag("op", "findOne")
+
 	q.m.Lock()
 	session := q.session
 	op := q.op // Copy.
@@ -3690,6 +3704,7 @@ func (q *Query) One(result interface{}) (err error) {
 
 	socket, err := session.acquireSocket(true)
 	if err != nil {
+		span.Tag("error", err.Error())
 		return err
 	}
 	defer socket.Release()
@@ -3702,6 +3717,7 @@ func (q *Query) One(result interface{}) (err error) {
 
 	data, err := socket.SimpleQuery(&op)
 	if err != nil {
+		span.Tag("error", err.Error())
 		return err
 	}
 	if data == nil {
@@ -3716,6 +3732,7 @@ func (q *Query) One(result interface{}) (err error) {
 		}
 		err = bson.Unmarshal(data, &findReply)
 		if err != nil {
+			span.Tag("error", err.Error())
 			return err
 		}
 		if !findReply.Ok && findReply.Errmsg != "" {
@@ -3731,6 +3748,7 @@ func (q *Query) One(result interface{}) (err error) {
 		if err == nil {
 			debugf("Query %p document unmarshaled: %#v", q, result)
 		} else {
+			span.Tag("error", err.Error())
 			debugf("Query %p document unmarshaling failed: %#v", q, err)
 			return err
 		}
@@ -4464,7 +4482,14 @@ func (iter *Iter) All(result interface{}) error {
 
 // All works like Iter.All.
 func (q *Query) All(result interface{}) error {
-	return q.Iter().All(result)
+	span, _ := q.session.tracer.StartSpanFromContext(q.ctx, "findAll")
+	defer span.Finish()
+	span.Tag("op", "findAll")
+	err := q.Iter().All(result)
+	if err != nil {
+		span.Tag("error", err.Error())
+	}
+	return err
 }
 
 // For method is obsolete and will be removed in a future release.
@@ -5496,6 +5521,9 @@ func (c *Collection) writeOpCommand(socket *mongoSocket, safeOp *queryOp, op int
 		writeConcern = safeOp.query.(*getLastError)
 	}
 
+	span, _ := c.Database.Session.tracer.StartSpanFromContext(c.Ctx, "writeOpCommand")
+	defer span.Finish()
+
 	var cmd bson.D
 	switch op := op.(type) {
 	case *insertOp:
@@ -5506,6 +5534,7 @@ func (c *Collection) writeOpCommand(socket *mongoSocket, safeOp *queryOp, op int
 			{Name: "writeConcern", Value: writeConcern},
 			{Name: "ordered", Value: op.flags&1 == 0},
 		}
+		span.Tag("op", "insertOp")
 	case *updateOp:
 		// http://docs.mongodb.org/manual/reference/command/update
 		cmd = bson.D{
@@ -5514,6 +5543,7 @@ func (c *Collection) writeOpCommand(socket *mongoSocket, safeOp *queryOp, op int
 			{Name: "writeConcern", Value: writeConcern},
 			{Name: "ordered", Value: ordered},
 		}
+		span.Tag("op", "updateOp")
 	case bulkUpdateOp:
 		// http://docs.mongodb.org/manual/reference/command/update
 		cmd = bson.D{
@@ -5522,6 +5552,7 @@ func (c *Collection) writeOpCommand(socket *mongoSocket, safeOp *queryOp, op int
 			{Name: "writeConcern", Value: writeConcern},
 			{Name: "ordered", Value: ordered},
 		}
+		span.Tag("op", "bulkUpdateOp")
 	case *deleteOp:
 		// http://docs.mongodb.org/manual/reference/command/delete
 		cmd = bson.D{
@@ -5530,6 +5561,7 @@ func (c *Collection) writeOpCommand(socket *mongoSocket, safeOp *queryOp, op int
 			{Name: "writeConcern", Value: writeConcern},
 			{Name: "ordered", Value: ordered},
 		}
+		span.Tag("op", "deleteOp")
 	case bulkDeleteOp:
 		// http://docs.mongodb.org/manual/reference/command/delete
 		cmd = bson.D{
@@ -5538,6 +5570,7 @@ func (c *Collection) writeOpCommand(socket *mongoSocket, safeOp *queryOp, op int
 			{Name: "writeConcern", Value: writeConcern},
 			{Name: "ordered", Value: ordered},
 		}
+		span.Tag("op", "bulkDeleteOp")
 	}
 	if bypassValidation {
 		cmd = append(cmd, bson.DocElem{Name: "bypassDocumentValidation", Value: true})
@@ -5572,6 +5605,11 @@ func (c *Collection) writeOpCommand(socket *mongoSocket, safeOp *queryOp, op int
 	if err == nil && safeOp == nil {
 		return nil, nil
 	}
+
+	if err != nil {
+		span.Tag("error", err.Error())
+	}
+
 	return lerr, err
 }
 
