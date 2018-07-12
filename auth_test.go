@@ -39,7 +39,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/globalsign/mgo"
+	"github.com/easyops.cn/mgo"
 	. "gopkg.in/check.v1"
 )
 
